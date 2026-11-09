@@ -19,7 +19,9 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <unordered_map>
 #include <vector>
 
@@ -362,6 +364,13 @@ private:
 		std::vector< float > normalVolumes;
 		std::vector< float > attenuatedVolumes;
 		bool attenuated;
+		/// Part of an internal pipeline (e.g. a loopback), so its audio comes from another node.
+		bool loopback;
+	};
+
+	struct Link {
+		uint32_t outputNode;
+		uint32_t inputNode;
 	};
 
 	PipeWireEngine &m_engine;
@@ -379,17 +388,21 @@ private:
 	pw_node_events m_nodeEvents;
 
 	std::unordered_map< uint32_t, std::unique_ptr< Node > > m_nodes;
+	std::unordered_map< uint32_t, Link > m_links;
 	bool m_attenuating;
 	int m_syncSeq;
 	bool m_synced;
 
 	void setAttenuating(bool attenuating);
+	bool shouldAttenuate(uint32_t id, const Node &node, const std::vector< uint32_t > &ownSinks) const;
+	std::vector< uint32_t > sinksOf(uint32_t nodeID) const;
 	static void setVolumes(Node &node, const std::vector< float > &volumes);
 
 	static void onCoreDone(void *data, uint32_t id, int seq);
 	static void onGlobal(void *data, uint32_t id, uint32_t permissions, const char *type, uint32_t version,
 						 const spa_dict *props);
 	static void onGlobalRemove(void *data, uint32_t id);
+	static void onNodeInfo(void *data, const pw_node_info *info);
 	static void onNodeParam(void *data, int seq, uint32_t id, uint32_t index, uint32_t next, const spa_pod *param);
 	static void onTimer(void *data, uint64_t expirations);
 
@@ -425,6 +438,7 @@ PipeWireAttenuator::PipeWireAttenuator(PipeWireEngine &engine, const std::atomic
 	pw_registry_add_listener(m_registry, &m_registryListener, &m_registryEvents, this);
 
 	m_nodeEvents.version = PW_VERSION_NODE_EVENTS;
+	m_nodeEvents.info    = onNodeInfo;
 	m_nodeEvents.param   = onNodeParam;
 
 	m_timer = pw_loop_add_timer(m_engine.m_loop, onTimer, this);
@@ -487,7 +501,8 @@ void PipeWireAttenuator::setAttenuating(const bool attenuating) {
 
 	m_attenuating = attenuating;
 
-	const uint32_t ownID = m_engine.nodeID();
+	const uint32_t ownID                   = m_engine.nodeID();
+	const std::vector< uint32_t > ownSinks = sinksOf(ownID);
 	// fOtherVolume is meant for cubic volumes (as used by PulseAudio), while channelVolumes are linear.
 	const float factor = std::pow(Global::get().s.fOtherVolume, 3.0f);
 
@@ -495,7 +510,7 @@ void PipeWireAttenuator::setAttenuating(const bool attenuating) {
 		Node &node = *entry.second;
 
 		if (attenuating) {
-			if (entry.first == ownID || node.volumes.empty()) {
+			if (entry.first == ownID || node.volumes.empty() || !shouldAttenuate(entry.first, node, ownSinks)) {
 				continue;
 			}
 
@@ -519,6 +534,35 @@ void PipeWireAttenuator::setAttenuating(const bool attenuating) {
 			}
 		}
 	}
+}
+
+bool PipeWireAttenuator::shouldAttenuate(const uint32_t id, const Node &node,
+										 const std::vector< uint32_t > &ownSinks) const {
+	if (!Global::get().s.bOnlyAttenuateSameOutput) {
+		// The audio of a loopback comes from streams that we already attenuate (or from ourselves).
+		return !node.loopback;
+	}
+
+	const std::vector< uint32_t > sinks = sinksOf(id);
+	const bool sameOutput               = std::any_of(sinks.cbegin(), sinks.cend(), [&ownSinks](const uint32_t sink) {
+		return std::find(ownSinks.cbegin(), ownSinks.cend(), sink) != ownSinks.cend();
+	});
+	if (!sameOutput) {
+		return false;
+	}
+
+	return !node.loopback || Global::get().s.bAttenuateLoopbacks;
+}
+
+std::vector< uint32_t > PipeWireAttenuator::sinksOf(const uint32_t nodeID) const {
+	std::vector< uint32_t > sinks;
+	for (const auto &entry : m_links) {
+		if (entry.second.outputNode == nodeID) {
+			sinks.push_back(entry.second.inputNode);
+		}
+	}
+
+	return sinks;
 }
 
 void PipeWireAttenuator::setVolumes(Node &node, const std::vector< float > &volumes) {
@@ -555,7 +599,36 @@ void PipeWireAttenuator::onGlobal(void *data, const uint32_t id, uint32_t, const
 								  const spa_dict *props) {
 	auto pwa = static_cast< PipeWireAttenuator * >(data);
 
-	if (!type || strcmp(type, PW_TYPE_INTERFACE_Node) != 0 || !props) {
+	if (!type || !props) {
+		return;
+	}
+
+	if (strcmp(type, PW_TYPE_INFO_INTERFACE_BASE "Link") == 0) {
+		const auto nodeID = [props](const char *key, uint32_t &value) {
+			const char *str = spa_dict_lookup(props, key);
+			if (!str) {
+				return false;
+			}
+
+			char *end;
+			const unsigned long number = strtoul(str, &end, 10);
+			if (end == str || *end != '\0' || number > std::numeric_limits< uint32_t >::max()) {
+				return false;
+			}
+
+			value = static_cast< uint32_t >(number);
+			return true;
+		};
+
+		Link link;
+		if (nodeID(PW_KEY_LINK_OUTPUT_NODE, link.outputNode) && nodeID(PW_KEY_LINK_INPUT_NODE, link.inputNode)) {
+			pwa->m_links[id] = link;
+		}
+
+		return;
+	}
+
+	if (strcmp(type, PW_TYPE_INTERFACE_Node) != 0) {
 		return;
 	}
 
@@ -573,6 +646,7 @@ void PipeWireAttenuator::onGlobal(void *data, const uint32_t id, uint32_t, const
 	node->proxy      = proxy;
 	node->listener   = {};
 	node->attenuated = false;
+	node->loopback   = false;
 
 	auto pwNode = reinterpret_cast< pw_node * >(proxy);
 	pw_node_add_listener(pwNode, &node->listener, &pwa->m_nodeEvents, node.get());
@@ -592,6 +666,8 @@ void PipeWireAttenuator::onGlobal(void *data, const uint32_t id, uint32_t, const
 void PipeWireAttenuator::onGlobalRemove(void *data, const uint32_t id) {
 	auto pwa = static_cast< PipeWireAttenuator * >(data);
 
+	pwa->m_links.erase(id);
+
 	auto it = pwa->m_nodes.find(id);
 	if (it == pwa->m_nodes.end()) {
 		return;
@@ -600,6 +676,14 @@ void PipeWireAttenuator::onGlobalRemove(void *data, const uint32_t id) {
 	spa_hook_remove(&it->second->listener);
 	pws->pw_proxy_destroy(it->second->proxy);
 	pwa->m_nodes.erase(it);
+}
+
+void PipeWireAttenuator::onNodeInfo(void *data, const pw_node_info *info) {
+	auto node = static_cast< Node * >(data);
+
+	if ((info->change_mask & PW_NODE_CHANGE_MASK_PROPS) && info->props) {
+		node->loopback = spa_dict_lookup(info->props, "node.link-group") != nullptr;
+	}
 }
 
 void PipeWireAttenuator::onNodeParam(void *data, int, const uint32_t id, uint32_t, uint32_t, const spa_pod *param) {

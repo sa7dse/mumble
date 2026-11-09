@@ -621,8 +621,8 @@ void AudioInputDialog::on_qrbNoiseSupBoth_toggled(bool checked) {
 	showSpeexNoiseSuppressionSlider(checked);
 }
 
-void AudioOutputDialog::enablePulseAudioAttenuationOptionsFor(const QString &outputName) {
-	if (outputName == QLatin1String("PulseAudio")) {
+void AudioOutputDialog::enableOutputSpecificAttenuationOptionsFor(const QString &outputName) {
+	if (outputName == QLatin1String("PulseAudio") || outputName == QLatin1String("PipeWire")) {
 		qcbOnlyAttenuateSameOutput->show();
 		qcbAttenuateLoopbacks->show();
 	} else {
@@ -736,7 +736,7 @@ void AudioOutputDialog::load(const Settings &r) {
 	qcbOnlyAttenuateSameOutput->setEnabled(attenuationActive);
 	qcbAttenuateLoopbacks->setEnabled(attenuationActive && r.bOnlyAttenuateSameOutput);
 
-	enablePulseAudioAttenuationOptionsFor(AudioOutputRegistrar::current);
+	enableOutputSpecificAttenuationOptionsFor(AudioOutputRegistrar::current);
 
 	loadSlider(qsJitter, r.iJitterBufferSize);
 	loadComboBox(qcbLoopback, r.lmLoopMode);
@@ -812,7 +812,7 @@ void AudioOutputDialog::on_qcbSystem_currentIndexChanged(int) {
 		qsOtherVolume->setEnabled(canmute);
 		qcbAttenuateOthersOnTalk->setEnabled(canmute);
 
-		enablePulseAudioAttenuationOptionsFor(aor->name);
+		enableOutputSpecificAttenuationOptionsFor(aor->name);
 
 		qcbAttenuateOthers->setEnabled(canmute);
 		qlOtherVolume->setEnabled(canmute);

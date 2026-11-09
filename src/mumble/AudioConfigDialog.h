@@ -74,7 +74,7 @@ private:
 	Q_OBJECT
 	Q_DISABLE_COPY(AudioOutputDialog)
 
-	void enablePulseAudioAttenuationOptionsFor(const QString &outputName);
+	void enableOutputSpecificAttenuationOptionsFor(const QString &outputName);
 
 public:
 	/// The unique name of this ConfigWidget

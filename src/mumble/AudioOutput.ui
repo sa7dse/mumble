@@ -430,13 +430,13 @@
       <item row="9" column="0" colspan="3">
        <widget class="QCheckBox" name="qcbAttenuateLoopbacks">
         <property name="toolTip">
-         <string>If checked, PulseAudio loopback modules will be attenuated</string>
+         <string>If checked, loopback modules will be attenuated</string>
         </property>
         <property name="whatsThis">
-         <string>&lt;b&gt;Attenuate PulseAudio loopback modules&lt;/b&gt;&lt;br /&gt;If loopback modules are linked to Mumble's output device/sink, they will also be attenuated.</string>
+         <string>&lt;b&gt;Attenuate loopback modules&lt;/b&gt;&lt;br /&gt;If loopback modules are linked to Mumble's output device/sink, they will also be attenuated.</string>
         </property>
         <property name="text">
-         <string>Attenuate PulseAudio loopback modules</string>
+         <string>Attenuate loopback modules</string>
         </property>
        </widget>
       </item>
