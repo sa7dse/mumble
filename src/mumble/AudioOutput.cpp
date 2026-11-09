@@ -458,6 +458,11 @@ void AudioOutput::prepareOutputBuffers(unsigned int frameCount, QList< AudioOutp
 	}
 }
 
+bool AudioOutput::shouldAttenuateOthers(bool mixedOutput) {
+	// Attenuation can be self-activated (e.g. while talking) or, if enabled in the settings, triggered by our output.
+	return Global::get().bAttenuateOthers || (mixedOutput && Global::get().s.bAttenuateOthers);
+}
+
 bool AudioOutput::mix(void *outbuff, unsigned int frameCount) {
 #ifdef USE_MANUAL_PLUGIN
 	positions.clear();

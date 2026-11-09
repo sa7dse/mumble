@@ -128,6 +128,9 @@ public:
 	virtual bool isAlive() const;
 	const float *getSpeakerPos(unsigned int &nspeakers);
 	static float calcGain(float dotproduct, float distance);
+	/// Whether other applications should currently be attenuated, given whether the last call to mix() produced
+	/// output.
+	static bool shouldAttenuateOthers(bool mixedOutput);
 	unsigned int getMixerFreq() const;
 	void setBufferSize(unsigned int bufferSize);
 	void setBufferPosition(const AudioOutputToken &, float x, float y, float z);

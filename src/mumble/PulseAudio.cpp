@@ -654,17 +654,11 @@ void PulseAudioSystem::write_callback(pa_stream *s, size_t bytes, void *userdata
 
 	static std::vector< unsigned char > buffer;
 	buffer.resize(bytes);
-	// do we have some mixed output?
-	if (pao->mix(buffer.data(), samples)) {
-		// attenuate if instructed to or it's in settings
-		pas->bAttenuating = (Global::get().bAttenuateOthers || Global::get().s.bAttenuateOthers);
-
-	} else {
+	const bool mixed = pao->mix(buffer.data(), samples);
+	if (!mixed) {
 		std::fill(buffer.begin(), buffer.end(), 0);
-
-		// attenuate if intructed to (self-activated)
-		pas->bAttenuating = Global::get().bAttenuateOthers;
 	}
+	pas->bAttenuating = AudioOutput::shouldAttenuateOthers(mixed);
 
 	// if the attenuation state has changed
 	if (oldAttenuation != pas->bAttenuating) {
