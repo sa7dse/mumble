@@ -9,10 +9,19 @@
 
 #include <pipewire/core.h>
 #include <pipewire/keys.h>
+#include <pipewire/node.h>
 #include <pipewire/stream.h>
+#include <pipewire/type.h>
 
 #include <spa/param/audio/format-utils.h>
+#include <spa/param/props.h>
 #include <spa/pod/builder.h>
+
+#include <algorithm>
+#include <cmath>
+#include <cstring>
+#include <unordered_map>
+#include <vector>
 
 #define RESOLVE(var)                                                  \
 	{                                                                 \
@@ -43,6 +52,7 @@ private:
 	const QList< audioDevice > getDeviceChoices() override;
 	void setDeviceChoice(const QVariant &, Settings &) override;
 	bool usesOutputDelay() const override;
+	bool canMuteOthers() const override;
 
 public:
 	PipeWireOutputRegistrar();
@@ -108,6 +118,10 @@ bool PipeWireOutputRegistrar::usesOutputDelay() const {
 	return false;
 }
 
+bool PipeWireOutputRegistrar::canMuteOthers() const {
+	return true;
+}
+
 void PipeWireInit::initialize() {
 	pws = std::make_unique< PipeWireSystem >();
 
@@ -161,11 +175,19 @@ PipeWireSystem::PipeWireSystem() : m_ok(false), m_users(0) {
 	RESOLVE(pw_thread_loop_stop);
 	RESOLVE(pw_thread_loop_lock);
 	RESOLVE(pw_thread_loop_unlock);
+	RESOLVE(pw_thread_loop_timed_wait);
+	RESOLVE(pw_thread_loop_signal);
+	RESOLVE(pw_context_new);
+	RESOLVE(pw_context_destroy);
+	RESOLVE(pw_context_connect);
+	RESOLVE(pw_core_disconnect);
+	RESOLVE(pw_proxy_destroy);
 	RESOLVE(pw_properties_new);
 	RESOLVE(pw_stream_new_simple);
 	RESOLVE(pw_stream_set_active);
 	RESOLVE(pw_stream_destroy);
 	RESOLVE(pw_stream_connect);
+	RESOLVE(pw_stream_get_node_id);
 	RESOLVE(pw_stream_dequeue_buffer);
 	RESOLVE(pw_stream_queue_buffer);
 
@@ -317,6 +339,294 @@ void PipeWireEngine::setActive(const bool active) {
 	pws->pw_stream_set_active(m_stream, active);
 	pws->pw_thread_loop_unlock(m_thread);
 }
+
+uint32_t PipeWireEngine::nodeID() {
+	return pws->pw_stream_get_node_id(m_stream);
+}
+
+/// Attenuates the playback streams of other applications by lowering their volume.
+///
+/// All callbacks run on the engine's thread loop. The decision whether to attenuate is made in the realtime process
+/// callback, which only publishes it through an atomic that a timer polls.
+class PipeWireAttenuator {
+public:
+	PipeWireAttenuator(PipeWireEngine &engine, const std::atomic< bool > &requested);
+	~PipeWireAttenuator();
+
+private:
+	struct Node {
+		pw_proxy *proxy;
+		spa_hook listener;
+		/// As last reported by the server or set by us.
+		std::vector< float > volumes;
+		std::vector< float > normalVolumes;
+		std::vector< float > attenuatedVolumes;
+		bool attenuated;
+	};
+
+	PipeWireEngine &m_engine;
+	const std::atomic< bool > &m_requested;
+
+	pw_context *m_context;
+	pw_core *m_core;
+	pw_registry *m_registry;
+	spa_source *m_timer;
+
+	spa_hook m_coreListener;
+	spa_hook m_registryListener;
+	pw_core_events m_coreEvents;
+	pw_registry_events m_registryEvents;
+	pw_node_events m_nodeEvents;
+
+	std::unordered_map< uint32_t, std::unique_ptr< Node > > m_nodes;
+	bool m_attenuating;
+	int m_syncSeq;
+	bool m_synced;
+
+	void setAttenuating(bool attenuating);
+	static void setVolumes(Node &node, const std::vector< float > &volumes);
+
+	static void onCoreDone(void *data, uint32_t id, int seq);
+	static void onGlobal(void *data, uint32_t id, uint32_t permissions, const char *type, uint32_t version,
+						 const spa_dict *props);
+	static void onGlobalRemove(void *data, uint32_t id);
+	static void onNodeParam(void *data, int seq, uint32_t id, uint32_t index, uint32_t next, const spa_pod *param);
+	static void onTimer(void *data, uint64_t expirations);
+
+	Q_DISABLE_COPY(PipeWireAttenuator)
+};
+
+PipeWireAttenuator::PipeWireAttenuator(PipeWireEngine &engine, const std::atomic< bool > &requested)
+	: m_engine(engine), m_requested(requested), m_context(nullptr), m_core(nullptr), m_registry(nullptr),
+	  m_timer(nullptr), m_coreListener(), m_registryListener(), m_coreEvents(), m_registryEvents(), m_nodeEvents(),
+	  m_attenuating(false), m_syncSeq(0), m_synced(false) {
+	m_context = pws->pw_context_new(m_engine.m_loop, nullptr, 0);
+	if (!m_context) {
+		return;
+	}
+
+	m_core = pws->pw_context_connect(m_context, nullptr, 0);
+	if (!m_core) {
+		return;
+	}
+
+	m_coreEvents.version = PW_VERSION_CORE_EVENTS;
+	m_coreEvents.done    = onCoreDone;
+	pw_core_add_listener(m_core, &m_coreListener, &m_coreEvents, this);
+
+	m_registry = pw_core_get_registry(m_core, PW_VERSION_REGISTRY, 0);
+	if (!m_registry) {
+		return;
+	}
+
+	m_registryEvents.version       = PW_VERSION_REGISTRY_EVENTS;
+	m_registryEvents.global        = onGlobal;
+	m_registryEvents.global_remove = onGlobalRemove;
+	pw_registry_add_listener(m_registry, &m_registryListener, &m_registryEvents, this);
+
+	m_nodeEvents.version = PW_VERSION_NODE_EVENTS;
+	m_nodeEvents.param   = onNodeParam;
+
+	m_timer = pw_loop_add_timer(m_engine.m_loop, onTimer, this);
+	if (m_timer) {
+		timespec interval{};
+		interval.tv_nsec = 50 * 1000 * 1000;
+		pw_loop_update_timer(m_engine.m_loop, m_timer, &interval, &interval, false);
+	}
+}
+
+PipeWireAttenuator::~PipeWireAttenuator() {
+	if (!m_context) {
+		return;
+	}
+
+	pws->pw_thread_loop_lock(m_engine.m_thread);
+
+	if (m_timer) {
+		pw_loop_destroy_source(m_engine.m_loop, m_timer);
+	}
+
+	if (m_attenuating) {
+		setAttenuating(false);
+
+		// Make sure the restored volumes reach the server before we disconnect.
+		m_syncSeq = pw_core_sync(m_core, PW_ID_CORE, 0);
+		while (!m_synced) {
+			if (pws->pw_thread_loop_timed_wait(m_engine.m_thread, 1) != 0) {
+				qWarning("PipeWireAttenuator: Timed out while restoring volumes");
+				break;
+			}
+		}
+	}
+
+	for (auto &entry : m_nodes) {
+		spa_hook_remove(&entry.second->listener);
+		pws->pw_proxy_destroy(entry.second->proxy);
+	}
+	m_nodes.clear();
+
+	if (m_registry) {
+		spa_hook_remove(&m_registryListener);
+		pws->pw_proxy_destroy(reinterpret_cast< pw_proxy * >(m_registry));
+	}
+
+	if (m_core) {
+		spa_hook_remove(&m_coreListener);
+		pws->pw_core_disconnect(m_core);
+	}
+
+	pws->pw_context_destroy(m_context);
+
+	pws->pw_thread_loop_unlock(m_engine.m_thread);
+}
+
+void PipeWireAttenuator::setAttenuating(const bool attenuating) {
+	if (attenuating == m_attenuating) {
+		return;
+	}
+
+	m_attenuating = attenuating;
+
+	const uint32_t ownID = m_engine.nodeID();
+	// fOtherVolume is meant for cubic volumes (as used by PulseAudio), while channelVolumes are linear.
+	const float factor = std::pow(Global::get().s.fOtherVolume, 3.0f);
+
+	for (auto &entry : m_nodes) {
+		Node &node = *entry.second;
+
+		if (attenuating) {
+			if (entry.first == ownID || node.volumes.empty()) {
+				continue;
+			}
+
+			node.normalVolumes     = node.volumes;
+			node.attenuatedVolumes = node.volumes;
+			for (float &volume : node.attenuatedVolumes) {
+				volume *= factor;
+			}
+
+			setVolumes(node, node.attenuatedVolumes);
+			node.attenuated = true;
+		} else if (node.attenuated) {
+			node.attenuated = false;
+
+			// Leave the volume alone if it was changed while we were attenuating.
+			const bool unchanged =
+				std::equal(node.volumes.cbegin(), node.volumes.cend(), node.attenuatedVolumes.cbegin(),
+						   node.attenuatedVolumes.cend(), [](float a, float b) { return std::abs(a - b) < 1e-5f; });
+			if (unchanged) {
+				setVolumes(node, node.normalVolumes);
+			}
+		}
+	}
+}
+
+void PipeWireAttenuator::setVolumes(Node &node, const std::vector< float > &volumes) {
+	uint8_t buffer[1024];
+
+	spa_pod_builder builder{};
+	builder.data = buffer;
+	builder.size = sizeof(buffer);
+
+	const auto param = static_cast< const spa_pod * >(
+		spa_pod_builder_add_object(&builder, SPA_TYPE_OBJECT_Props, SPA_PARAM_Props, SPA_PROP_channelVolumes,
+								   SPA_POD_Array(static_cast< int >(sizeof(float)), SPA_TYPE_Float,
+												 static_cast< int >(volumes.size()), volumes.data())));
+	if (!param) {
+		return;
+	}
+
+	pw_node_set_param(reinterpret_cast< pw_node * >(node.proxy), SPA_PARAM_Props, 0, param);
+
+	// Remember what we set, so that we can tell on restore whether somebody else changed it in the meantime.
+	node.volumes = volumes;
+}
+
+void PipeWireAttenuator::onCoreDone(void *data, const uint32_t id, const int seq) {
+	auto pwa = static_cast< PipeWireAttenuator * >(data);
+
+	if (id == PW_ID_CORE && seq == pwa->m_syncSeq) {
+		pwa->m_synced = true;
+		pws->pw_thread_loop_signal(pwa->m_engine.m_thread, false);
+	}
+}
+
+void PipeWireAttenuator::onGlobal(void *data, const uint32_t id, uint32_t, const char *type, uint32_t,
+								  const spa_dict *props) {
+	auto pwa = static_cast< PipeWireAttenuator * >(data);
+
+	if (!type || strcmp(type, PW_TYPE_INTERFACE_Node) != 0 || !props) {
+		return;
+	}
+
+	const char *mediaClass = spa_dict_lookup(props, PW_KEY_MEDIA_CLASS);
+	if (!mediaClass || strcmp(mediaClass, "Stream/Output/Audio") != 0) {
+		return;
+	}
+
+	auto proxy = static_cast< pw_proxy * >(pw_registry_bind(pwa->m_registry, id, type, PW_VERSION_NODE, 0));
+	if (!proxy) {
+		return;
+	}
+
+	auto node        = std::make_unique< Node >();
+	node->proxy      = proxy;
+	node->listener   = {};
+	node->attenuated = false;
+
+	auto pwNode = reinterpret_cast< pw_node * >(proxy);
+	pw_node_add_listener(pwNode, &node->listener, &pwa->m_nodeEvents, node.get());
+
+	uint32_t params[] = { SPA_PARAM_Props };
+	pw_node_subscribe_params(pwNode, params, 1);
+
+	auto old = pwa->m_nodes.find(id);
+	if (old != pwa->m_nodes.end()) {
+		spa_hook_remove(&old->second->listener);
+		pws->pw_proxy_destroy(old->second->proxy);
+	}
+
+	pwa->m_nodes[id] = std::move(node);
+}
+
+void PipeWireAttenuator::onGlobalRemove(void *data, const uint32_t id) {
+	auto pwa = static_cast< PipeWireAttenuator * >(data);
+
+	auto it = pwa->m_nodes.find(id);
+	if (it == pwa->m_nodes.end()) {
+		return;
+	}
+
+	spa_hook_remove(&it->second->listener);
+	pws->pw_proxy_destroy(it->second->proxy);
+	pwa->m_nodes.erase(it);
+}
+
+void PipeWireAttenuator::onNodeParam(void *data, int, const uint32_t id, uint32_t, uint32_t, const spa_pod *param) {
+	auto node = static_cast< Node * >(data);
+
+	if (id != SPA_PARAM_Props || !param || !spa_pod_is_object_type(param, SPA_TYPE_OBJECT_Props)) {
+		return;
+	}
+
+	const spa_pod_prop *prop = spa_pod_find_prop(param, nullptr, SPA_PROP_channelVolumes);
+	if (!prop) {
+		return;
+	}
+
+	float volumes[SPA_AUDIO_MAX_CHANNELS];
+	const uint32_t count = spa_pod_copy_array(&prop->value, SPA_TYPE_Float, volumes, SPA_AUDIO_MAX_CHANNELS);
+	if (count > 0) {
+		node->volumes.assign(volumes, volumes + count);
+	}
+}
+
+void PipeWireAttenuator::onTimer(void *data, uint64_t) {
+	auto pwa = static_cast< PipeWireAttenuator * >(data);
+
+	pwa->setAttenuating(pwa->m_requested.load(std::memory_order_relaxed));
+}
+
 PipeWireInput::PipeWireInput() {
 	m_engine = std::make_unique< PipeWireEngine >("Capture", this, processCallback);
 	if (!m_engine->isOk()) {
@@ -374,7 +684,7 @@ void PipeWireInput::onUserMutedChanged() {
 	m_engine->setActive(!bUserIsMuted);
 }
 
-PipeWireOutput::PipeWireOutput() {
+PipeWireOutput::PipeWireOutput() : m_attenuationRequested(false) {
 	m_engine = std::make_unique< PipeWireEngine >("Playback", this, processCallback);
 	if (!m_engine->isOk()) {
 		return;
@@ -403,10 +713,15 @@ PipeWireOutput::PipeWireOutput() {
 	iMixerFreq    = SAMPLE_RATE;
 	initializeMixer(CHANNELS);
 
+	m_attenuator = std::make_unique< PipeWireAttenuator >(*m_engine, m_attenuationRequested);
+
 	m_engine->start();
 }
 
 PipeWireOutput::~PipeWireOutput() {
+	// Needs the running thread loop to restore the volumes.
+	m_attenuator.reset();
+
 	m_engine->stop();
 }
 
@@ -434,7 +749,10 @@ void PipeWireOutput::processCallback(void *param) {
 	const uint32_t frames = std::min(data.maxsize / static_cast< std::uint32_t >(chunk->stride), pwo->iFrameSize);
 
 	chunk->size = frames * static_cast< unsigned int >(chunk->stride);
-	if (!pwo->mix(data.data, frames)) {
+
+	const bool mixed = pwo->mix(data.data, frames);
+	pwo->m_attenuationRequested.store(AudioOutput::shouldAttenuateOthers(mixed), std::memory_order_relaxed);
+	if (!mixed) {
 		// When the mixer has no data available to write, we still need to push silence.
 		// This is to avoid an infinite loop when destroying the stream.
 		// In that infinite loop, Pipewire would wait until the stream starts draining.

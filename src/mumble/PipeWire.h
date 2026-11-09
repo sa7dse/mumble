@@ -13,11 +13,17 @@
 #include <QMutex>
 #include <QWaitCondition>
 
+#include <atomic>
+
+class PipeWireAttenuator;
 class PipeWireInit;
 
 struct pw_buffer;
+struct pw_context;
+struct pw_core;
 struct pw_loop;
 struct pw_properties;
+struct pw_proxy;
 struct pw_stream;
 struct pw_stream_events;
 struct pw_thread_loop;
@@ -26,6 +32,8 @@ struct spa_dict;
 struct spa_pod;
 
 class PipeWireEngine {
+	friend PipeWireAttenuator;
+
 public:
 	bool isOk() { return m_ok; };
 
@@ -37,6 +45,7 @@ public:
 	pw_buffer *dequeueBuffer();
 	void queueBuffer(pw_buffer *buffer);
 	void setActive(bool active);
+	uint32_t nodeID();
 
 	PipeWireEngine(const char *category, void *param, const std::function< void(void *param) > callback);
 	~PipeWireEngine();
@@ -53,6 +62,7 @@ private:
 };
 
 class PipeWireSystem : public QObject {
+	friend PipeWireAttenuator;
 	friend PipeWireEngine;
 	friend PipeWireInit;
 
@@ -81,6 +91,15 @@ protected:
 	int (*pw_thread_loop_stop)(pw_thread_loop *loop);
 	void (*pw_thread_loop_lock)(pw_thread_loop *loop);
 	void (*pw_thread_loop_unlock)(pw_thread_loop *loop);
+	int (*pw_thread_loop_timed_wait)(pw_thread_loop *loop, int wait_max_sec);
+	void (*pw_thread_loop_signal)(pw_thread_loop *loop, bool wait_for_accept);
+
+	pw_context *(*pw_context_new)(pw_loop *main_loop, pw_properties *props, size_t user_data_size);
+	void (*pw_context_destroy)(pw_context *context);
+	pw_core *(*pw_context_connect)(pw_context *context, pw_properties *properties, size_t user_data_size);
+	int (*pw_core_disconnect)(pw_core *core);
+
+	void (*pw_proxy_destroy)(pw_proxy *proxy);
 
 	pw_properties *(*pw_properties_new)(const char *key, ...);
 
@@ -90,6 +109,7 @@ protected:
 	void (*pw_stream_destroy)(pw_stream *stream);
 	int (*pw_stream_connect)(pw_stream *stream, uint32_t direction, uint32_t target_id, uint32_t flags,
 							 const spa_pod **params, uint32_t n_params);
+	uint32_t (*pw_stream_get_node_id)(pw_stream *stream);
 	pw_buffer *(*pw_stream_dequeue_buffer)(pw_stream *stream);
 	int (*pw_stream_queue_buffer)(pw_stream *stream, pw_buffer *buffer);
 
@@ -126,6 +146,8 @@ public:
 
 protected:
 	std::unique_ptr< PipeWireEngine > m_engine;
+	std::unique_ptr< PipeWireAttenuator > m_attenuator;
+	std::atomic< bool > m_attenuationRequested;
 
 	static void processCallback(void *param);
 
