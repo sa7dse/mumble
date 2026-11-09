@@ -390,6 +390,8 @@ private:
 	std::unordered_map< uint32_t, std::unique_ptr< Node > > m_nodes;
 	std::unordered_map< uint32_t, Link > m_links;
 	bool m_attenuating;
+	/// Links changed since the attenuated streams were last determined.
+	bool m_routingChanged;
 	int m_syncSeq;
 	bool m_synced;
 
@@ -412,7 +414,7 @@ private:
 PipeWireAttenuator::PipeWireAttenuator(PipeWireEngine &engine, const std::atomic< bool > &requested)
 	: m_engine(engine), m_requested(requested), m_context(nullptr), m_core(nullptr), m_registry(nullptr),
 	  m_timer(nullptr), m_coreListener(), m_registryListener(), m_coreEvents(), m_registryEvents(), m_nodeEvents(),
-	  m_attenuating(false), m_syncSeq(0), m_synced(false) {
+	  m_attenuating(false), m_routingChanged(false), m_syncSeq(0), m_synced(false) {
 	m_context = pws->pw_context_new(m_engine.m_loop, nullptr, 0);
 	if (!m_context) {
 		return;
@@ -495,25 +497,32 @@ PipeWireAttenuator::~PipeWireAttenuator() {
 }
 
 void PipeWireAttenuator::setAttenuating(const bool attenuating) {
-	if (attenuating == m_attenuating) {
+	// Which streams to attenuate depends on the routing, e.g. when our stream was moved to another device.
+	if (attenuating == m_attenuating && !(attenuating && m_routingChanged)) {
 		return;
 	}
 
-	m_attenuating = attenuating;
-
 	const uint32_t ownID                   = m_engine.nodeID();
 	const std::vector< uint32_t > ownSinks = sinksOf(ownID);
+
+	// While our stream is being moved, it is briefly not linked to any sink. Keep the current state instead of
+	// restoring and attenuating again a moment later.
+	if (attenuating && m_attenuating && ownSinks.empty()) {
+		return;
+	}
+
+	m_attenuating    = attenuating;
+	m_routingChanged = false;
 	// fOtherVolume is meant for cubic volumes (as used by PulseAudio), while channelVolumes are linear.
 	const float factor = std::pow(Global::get().s.fOtherVolume, 3.0f);
 
 	for (auto &entry : m_nodes) {
 		Node &node = *entry.second;
 
-		if (attenuating) {
-			if (entry.first == ownID || node.volumes.empty() || !shouldAttenuate(entry.first, node, ownSinks)) {
-				continue;
-			}
+		const bool attenuate = attenuating && entry.first != ownID && !node.volumes.empty()
+							   && shouldAttenuate(entry.first, node, ownSinks);
 
+		if (attenuate && !node.attenuated) {
 			node.normalVolumes     = node.volumes;
 			node.attenuatedVolumes = node.volumes;
 			for (float &volume : node.attenuatedVolumes) {
@@ -522,7 +531,7 @@ void PipeWireAttenuator::setAttenuating(const bool attenuating) {
 
 			setVolumes(node, node.attenuatedVolumes);
 			node.attenuated = true;
-		} else if (node.attenuated) {
+		} else if (!attenuate && node.attenuated) {
 			node.attenuated = false;
 
 			// Leave the volume alone if it was changed while we were attenuating.
@@ -622,7 +631,8 @@ void PipeWireAttenuator::onGlobal(void *data, const uint32_t id, uint32_t, const
 
 		Link link;
 		if (nodeID(PW_KEY_LINK_OUTPUT_NODE, link.outputNode) && nodeID(PW_KEY_LINK_INPUT_NODE, link.inputNode)) {
-			pwa->m_links[id] = link;
+			pwa->m_links[id]      = link;
+			pwa->m_routingChanged = true;
 		}
 
 		return;
@@ -666,7 +676,9 @@ void PipeWireAttenuator::onGlobal(void *data, const uint32_t id, uint32_t, const
 void PipeWireAttenuator::onGlobalRemove(void *data, const uint32_t id) {
 	auto pwa = static_cast< PipeWireAttenuator * >(data);
 
-	pwa->m_links.erase(id);
+	if (pwa->m_links.erase(id) > 0) {
+		pwa->m_routingChanged = true;
+	}
 
 	auto it = pwa->m_nodes.find(id);
 	if (it == pwa->m_nodes.end()) {
