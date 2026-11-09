@@ -216,7 +216,7 @@ PipeWireEngine::PipeWireEngine(const char *category, void *param, const std::fun
 	}
 
 	pw_properties *props =
-		pws->pw_properties_new(PW_KEY_APP_NAME, "Mumble", PW_KEY_NODE_NAME, category, PW_KEY_MEDIA_CATEGORY, category,
+		pws->pw_properties_new(PW_KEY_APP_NAME, "Mumble", PW_KEY_NODE_NAME, "Mumble", PW_KEY_MEDIA_CATEGORY, category,
 							   PW_KEY_MEDIA_TYPE, "Audio", PW_KEY_MEDIA_ROLE, "Communication", nullptr);
 
 	m_events          = std::make_unique< pw_stream_events >();
